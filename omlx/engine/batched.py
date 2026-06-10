@@ -14,7 +14,12 @@ from typing import Any
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..utils.tokenizer import get_tokenizer_config
-from .base import BaseEngine, GenerationOutput, _warn_scheduler_unreachable_once
+from .base import (
+    BaseEngine,
+    GenerationOutput,
+    _warn_scheduler_unreachable_once,
+    resolve_specprefill_kwargs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -549,9 +554,13 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
+        # SpecPrefill: per-request overrides, falling back to model settings
+        specprefill_kwargs = resolve_specprefill_kwargs(kwargs, self._model_settings)
+
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            **specprefill_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -618,22 +627,8 @@ class BatchedEngine(BaseEngine):
             seed=kwargs.get("seed", None),
         )
 
-        # SpecPrefill: pass per-request overrides to engine
-        specprefill_kwargs = {}
-        if kwargs.get("specprefill") is not None:
-            specprefill_kwargs["specprefill"] = kwargs.pop("specprefill")
-        if kwargs.get("specprefill_keep_pct") is not None:
-            specprefill_kwargs["specprefill_keep_pct"] = kwargs.pop(
-                "specprefill_keep_pct"
-            )
-        if kwargs.get("specprefill_threshold") is not None:
-            specprefill_kwargs["specprefill_threshold"] = kwargs.pop(
-                "specprefill_threshold"
-            )
-        if kwargs.get("specprefill_system_end") is not None:
-            specprefill_kwargs["specprefill_system_end"] = kwargs.pop(
-                "specprefill_system_end"
-            )
+        # SpecPrefill: per-request overrides, falling back to model settings
+        specprefill_kwargs = resolve_specprefill_kwargs(kwargs, self._model_settings)
 
         engine = self._engine
         request_id = await engine.add_request(
