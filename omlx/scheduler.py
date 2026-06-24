@@ -1300,6 +1300,11 @@ class SchedulerConfig:
     # store — think-stripping templates can never match them, and storing
     # dead tokens causes prefill/discard thrashing (issue #93).
     cache_thinking_outputs: bool | None = None
+    # Tool-call parser selection. None means auto-select from the chat template
+    # (the default). "none"/"off" disables tool-call extraction entirely so the
+    # raw model tokens pass straight through to the assistant message content
+    # (for downstream systems that own their own tool-call parsing).
+    tool_call_parser: str | None = None
 
     # GC/cleanup settings (memory optimization)
     gc_cleanup_interval: int = 0  # Steps between gc.collect() calls (0=disabled)
