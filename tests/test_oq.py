@@ -17,19 +17,18 @@ except ImportError:
     HAS_MLX = False
 
 from omlx.oq import (
-    OQ_LEVELS,
     _LEVEL_BITS,
     _MAX_MODEL_RAM_FRACTION,
     _OQ_BPW_TARGETS,
     _PROXY_QUANT_BITS,
     _PROXY_QUANT_GROUP_SIZE,
-    _DiscoveredPlan,
-    _TrackedTensor,
+    OQ_LEVELS,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
-    _build_streaming_proxy_for_sensitivity,
     _build_quant_plan,
+    _build_streaming_proxy_for_sensitivity,
     _discover_sanitize_plan,
+    _DiscoveredPlan,
     _extract_layer_index,
     _format_size,
     _forward_layer,
@@ -40,12 +39,15 @@ from omlx.oq import (
     _is_vision_tensor,
     _LazyTensorIndex,
     _measure_sensitivity,
+    _measure_sensitivity_from_quantized_model,
     _normalize_quant_path,
     _perturb_bits_for,
     _prefuse_moe_experts_for_vlm,
     _progress_total_bytes,
     _quantize_chunked,
+    _sensitivity_lm_config_override,
     _should_quantize_tensor,
+    _TrackedTensor,
     _validate_oq_dtype_for_model,
     estimate_bpw_and_size,
     estimate_memory,
@@ -732,8 +734,14 @@ class TestValidateQuantizable:
     def test_already_quantized(self):
         assert validate_quantizable({"quantization": {"bits": 4}}) is False
 
-    def test_quantization_config(self):
-        assert validate_quantizable({"quantization_config": {"bits": 4}}) is False
+    def test_quantization_config_with_known_method(self):
+        # Real HF quantization configs always carry quant_method
+        assert (
+            validate_quantizable(
+                {"quantization_config": {"quant_method": "gptq", "bits": 4}}
+            )
+            is False
+        )
 
     def test_fp8_native_is_quantizable(self):
         # Native FP8 models (MiniMax, DeepSeek) should be quantizable
@@ -748,6 +756,79 @@ class TestValidateQuantizable:
             validate_quantizable({"quantization_config": {"quant_method": "gptq"}})
             is False
         )
+
+    def test_qat_no_quant_method_is_quantizable(self):
+        # QAT models have quantization_config with no quant_method — full-precision weights
+        assert (
+            validate_quantizable({"quantization_config": {"quant_type": "q4_0"}})
+            is True
+        )
+
+    def test_empty_quantization_config_not_quantizable(self):
+        # Empty config has no quant_type — not a QAT config, not quantizable
+        assert validate_quantizable({"quantization_config": {}}) is False
+
+    def test_legacy_bits_config_not_quantizable(self):
+        # Legacy configs with only {"bits": N} lack quant_type and are not QAT
+        assert validate_quantizable({"quantization_config": {"bits": 4}}) is False
+
+    def test_awq_not_quantizable(self):
+        assert (
+            validate_quantizable({"quantization_config": {"quant_method": "awq"}})
+            is False
+        )
+
+
+# =============================================================================
+# Test _sensitivity_lm_config_override
+# =============================================================================
+
+
+class TestSensitivityLmConfigOverride:
+    def test_no_quantization_config(self):
+        assert _sensitivity_lm_config_override({"model_type": "llama"}) is None
+
+    def test_qat_config_top_level(self):
+        # QAT config with no quant_method → should override
+        result = _sensitivity_lm_config_override(
+            {"quantization_config": {"quant_type": "q4_0"}}
+        )
+        assert result == {"quantization_config": None}
+
+    def test_qat_config_in_text_config(self):
+        # QAT config nested in text_config (VLM layout) → should override
+        result = _sensitivity_lm_config_override(
+            {"text_config": {"quantization_config": {"quant_type": "q4_0"}}}
+        )
+        assert result == {"quantization_config": None}
+
+    def test_fp8_config_no_override(self):
+        # FP8 has quant_method set — not a QAT config, no override needed
+        assert (
+            _sensitivity_lm_config_override(
+                {"quantization_config": {"quant_method": "fp8"}}
+            )
+            is None
+        )
+
+    def test_known_method_no_override(self):
+        assert (
+            _sensitivity_lm_config_override(
+                {"quantization_config": {"quant_method": "gptq"}}
+            )
+            is None
+        )
+
+    def test_non_qat_config_without_quant_method_no_override(self):
+        # Legacy bits-only config has no quant_type — not a QAT config, no override
+        assert (
+            _sensitivity_lm_config_override({"quantization_config": {"bits": 4}})
+            is None
+        )
+
+    def test_empty_quantization_config(self):
+        # Empty dict: no quant_method but also nothing to process — no override
+        assert _sensitivity_lm_config_override({"quantization_config": {}}) is None
 
 
 # =============================================================================
@@ -914,7 +995,7 @@ class TestLevelBudgetPlan:
 
     def test_bpw_targets_for_level_returns_correct_values(self):
         assert _bpw_targets_for_level(2.5) == (3.1, 3.3)
-        assert _bpw_targets_for_level(2.7) == (3.35, 3.45)
+        assert _bpw_targets_for_level(2.8) == (3.35, 3.45)
         assert _bpw_targets_for_level(3) == (3.5, 3.7)
         assert _bpw_targets_for_level(3.5) == (3.8, 4.0)
         assert _bpw_targets_for_level(4) == (4.6, 4.7)
@@ -923,9 +1004,9 @@ class TestLevelBudgetPlan:
 
     def test_oq25_base_bits_is_2(self):
         assert _LEVEL_BITS[2.5] == 2
-        assert _LEVEL_BITS[2.7] == 2
+        assert _LEVEL_BITS[2.8] == 2
 
-    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)])
+    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (3.5, 4)])
     def test_half_level_mandatory_expert_down_proj_boost(self, oq_level, expected_bits):
         """Fractional levels protect routed expert down_proj above base bits
         even with negligible sensitivity scores."""
@@ -948,7 +1029,7 @@ class TestLevelBudgetPlan:
         assert boost is not None
         assert boost["bits"] == expected_bits
 
-    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (2.7, 4), (3.5, 4)])
+    @pytest.mark.parametrize("oq_level,expected_bits", [(2.5, 3), (3.5, 4)])
     def test_predicate_floor_for_expert_down_proj(self, oq_level, expected_bits):
         """The non-budget predicate floor mirrors the mandatory boost."""
         config = {
@@ -961,6 +1042,18 @@ class TestLevelBudgetPlan:
         )
         assert isinstance(result, dict)
         assert result["bits"] == expected_bits
+
+    def test_oq28_predicate_keeps_routed_down_proj_at_base_without_plan(self):
+        """oQ2.8 uses budget-planned routed boosts, not a blanket predicate floor."""
+        config = {
+            "num_hidden_layers": 32,
+            "num_experts": 8,
+            "hidden_size": 1024,
+        }
+        result = universal_quant_predicate(
+            "model.layers.5.mlp.switch_mlp.down_proj", None, config, 2.8
+        )
+        assert result is True
 
     def test_bpw_targets_for_level_returns_none_for_minimal(self):
         assert _bpw_targets_for_level(8) is None
@@ -1076,6 +1169,43 @@ class TestLevelBudgetPlan:
         )
         for k in plan.boost_map:
             assert "switch_mlp" not in k
+
+    def test_oq28_boosts_routed_down_proj_by_layer_sensitivity(self):
+        """oQ2.8 can boost routed projections, but only by whole layer modules."""
+        named_shapes = {}
+        for i in range(2):
+            named_shapes[f"model.layers.{i}.ffn.switch_mlp.gate_proj"] = (8, 64, 64)
+            named_shapes[f"model.layers.{i}.ffn.switch_mlp.up_proj"] = (8, 64, 64)
+            named_shapes[f"model.layers.{i}.ffn.switch_mlp.down_proj"] = (8, 64, 64)
+        config = {
+            "num_hidden_layers": 2,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 1.0, "1": 0.1},
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2.8, target_bpw=2.65, hard_cap_bpw=2.7
+        )
+        assert plan.boost_map["model.layers.0.ffn.switch_mlp.down_proj"]["bits"] == 3
+        assert "model.layers.1.ffn.switch_mlp.down_proj" not in plan.boost_map
+
+    def test_oq28_boosts_gate_up_pair_after_routed_down_proj(self):
+        """After routed w2/down_proj, oQ2.8 boosts gate+up as a layer pair."""
+        named_shapes = {
+            "model.layers.0.ffn.switch_mlp.gate_proj": (8, 64, 64),
+            "model.layers.0.ffn.switch_mlp.up_proj": (8, 64, 64),
+            "model.layers.0.ffn.switch_mlp.down_proj": (8, 64, 64),
+        }
+        config = {
+            "num_hidden_layers": 1,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 1.0},
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2.8, target_bpw=3.4, hard_cap_bpw=3.6
+        )
+        assert plan.boost_map["model.layers.0.ffn.switch_mlp.down_proj"]["bits"] == 3
+        assert plan.boost_map["model.layers.0.ffn.switch_mlp.gate_proj"]["bits"] == 3
+        assert plan.boost_map["model.layers.0.ffn.switch_mlp.up_proj"]["bits"] == 3
 
     def test_oq2_budget_plan_respects_cap(self):
         """oQ2 with budget plan should stay within hard cap."""
@@ -1492,6 +1622,19 @@ class TestTrackedTensor:
         assert r.sources == ["a"]
         assert r.recipe == [("transpose", (0, 2, 1))]
 
+    def test_expand_dims_method(self):
+        t = _TrackedTensor((2, 3), "F16", sources=["a"])
+        r = t.expand_dims(axis=0)
+        assert r.shape == (1, 2, 3)
+        assert r.transform == "expand_dims"
+        assert r.recipe == [("expand_dims", (0,))]
+
+    def test_expand_dims_multiple_axes(self):
+        t = _TrackedTensor((2, 3), "F16", sources=["a"])
+        r = t.expand_dims(axis=(0, -2))
+        assert r.shape == (1, 2, 1, 3)
+        assert r.recipe == [("expand_dims", (0, 2))]
+
     def test_getitem_ellipsis_half_split(self):
         # Sanitize patterns like gate_up[..., :mid, :] must round-trip through
         # the tracked-tensor dry run so streaming discovery covers low-RAM
@@ -1657,6 +1800,115 @@ class TestDiscoverSanitizePlan:
             atol=1e-3,
         )
 
+    def test_expand_dims_sanitize_replays(self, tmp_path):
+        path = tmp_path / "weights.safetensors"
+        tensor = np.arange(6, dtype=np.float16).reshape(2, 3)
+        _write_safetensors(str(path), {"shared_down.weight": tensor})
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize(weights):
+            return {
+                "shared_down.weight": mx.expand_dims(
+                    weights["shared_down.weight"], axis=0
+                )
+            }
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        assert plan["shared_down.weight"]["shape"] == (1, 2, 3)
+        assert plan["shared_down.weight"]["recipe"] == [("expand_dims", (0,))]
+
+        result = _DiscoveredPlan(plan, idx).pop("shared_down.weight")
+        np.testing.assert_array_equal(np.array(result), tensor[None, :, :])
+
+    def test_minimax_shared_expert_sanitize_replays(self, tmp_path):
+        path = tmp_path / "weights.safetensors"
+        tensors = {}
+        for name, start in (
+            ("experts.0.w1.weight", 0),
+            ("experts.1.w1.weight", 10),
+            ("experts.0.w3.weight", 20),
+            ("experts.1.w3.weight", 30),
+            ("shared.gate.weight", 40),
+            ("shared.up.weight", 50),
+            ("experts.0.w2.weight", 60),
+            ("experts.1.w2.weight", 70),
+            ("shared.down.weight", 80),
+        ):
+            tensors[name] = (np.arange(6, dtype=np.float16) + start).reshape(2, 3)
+        _write_safetensors(str(path), tensors)
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize(weights):
+            weights = dict(weights)
+            gate = mx.stack(
+                [weights.pop("experts.0.w1.weight"), weights.pop("experts.1.w1.weight")]
+            )
+            up = mx.stack(
+                [weights.pop("experts.0.w3.weight"), weights.pop("experts.1.w3.weight")]
+            )
+            routed_gate_up = mx.concatenate([gate, up], axis=1)
+            shared_gate_up = mx.expand_dims(
+                mx.concatenate(
+                    [
+                        weights.pop("shared.gate.weight"),
+                        weights.pop("shared.up.weight"),
+                    ],
+                    axis=0,
+                ),
+                axis=0,
+            )
+            down = mx.stack(
+                [weights.pop("experts.0.w2.weight"), weights.pop("experts.1.w2.weight")]
+            )
+            shared_down = mx.expand_dims(weights.pop("shared.down.weight"), axis=0)
+            return {
+                "switch.gate_up.weight": mx.concatenate(
+                    [routed_gate_up, shared_gate_up], axis=0
+                ),
+                "switch.down.weight": mx.concatenate([down, shared_down], axis=0),
+            }
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        assert plan["switch.gate_up.weight"]["transform"] == "expr"
+        assert plan["switch.gate_up.weight"]["shape"] == (3, 4, 3)
+        assert plan["switch.down.weight"]["transform"] == "expr"
+        assert plan["switch.down.weight"]["shape"] == (3, 2, 3)
+
+        discovered = _DiscoveredPlan(plan, idx)
+        gate = np.stack(
+            [tensors["experts.0.w1.weight"], tensors["experts.1.w1.weight"]]
+        )
+        up = np.stack([tensors["experts.0.w3.weight"], tensors["experts.1.w3.weight"]])
+        expected_gate_up = np.concatenate(
+            [
+                np.concatenate([gate, up], axis=1),
+                np.concatenate(
+                    [tensors["shared.gate.weight"], tensors["shared.up.weight"]],
+                    axis=0,
+                )[None, :, :],
+            ],
+            axis=0,
+        )
+        expected_down = np.concatenate(
+            [
+                np.stack(
+                    [
+                        tensors["experts.0.w2.weight"],
+                        tensors["experts.1.w2.weight"],
+                    ]
+                ),
+                tensors["shared.down.weight"][None, :, :],
+            ],
+            axis=0,
+        )
+
+        np.testing.assert_array_equal(
+            np.array(discovered.pop("switch.gate_up.weight")), expected_gate_up
+        )
+        np.testing.assert_array_equal(
+            np.array(discovered.pop("switch.down.weight")), expected_down
+        )
+
     def test_conditional_mtp_norm_add_materializes_by_mean(self, tmp_path):
         path = tmp_path / "mtp_norms.safetensors"
         tensors = {
@@ -1773,9 +2025,7 @@ class TestBuildProxyForSensitivity:
             trust_remote_code=True,
         )
 
-        assert calls == [
-            (str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)
-        ]
+        assert calls == [(str(tmp_path / "src_model"), proxy_dir, "bfloat16", True)]
         assert proxy_dir.exists()
 
     def test_returns_path_under_system_temp(self, tmp_path):
@@ -1888,12 +2138,11 @@ class TestBuildProxyForSensitivity:
             str(src / "model.safetensors"),
         )
 
-        with patch("omlx.oq._build_model_sanitizer", return_value=None), patch(
-            "omlx.oq._build_non_quantizable_set", return_value=set()
+        with (
+            patch("omlx.oq._build_model_sanitizer", return_value=None),
+            patch("omlx.oq._build_non_quantizable_set", return_value=set()),
         ):
-            _build_streaming_proxy_for_sensitivity(
-                str(src), out, dtype="bfloat16"
-            )
+            _build_streaming_proxy_for_sensitivity(str(src), out, dtype="bfloat16")
 
         config = json.loads((out / "config.json").read_text(encoding="utf-8"))
         assert config["quantization"]["bits"] == _PROXY_QUANT_BITS
@@ -2728,9 +2977,9 @@ class TestQuantizeOqStreamingFp8:
 
     def test_exceeds_ram_no_scratch_files(self, tmp_path):
         """On-the-fly dequant produces zero scratch/temp shard files."""
-        from unittest.mock import patch
-        import tempfile
         import os
+        import tempfile
+        from unittest.mock import patch
 
         src = tmp_path / "src"
         src.mkdir()
@@ -3008,6 +3257,75 @@ class TestBuildModelSanitizerTextOnly:
             info_messages = [str(c) for c in mock_logger.info.call_args_list]
             all_messages = " ".join(debug_messages + info_messages)
             assert "mlx-vlm full sanitize" not in all_messages
+
+
+class TestBuildModelSanitizerMiniMaxCompat:
+    def test_minimax_vlm_applies_compat_before_model_lookup(self, monkeypatch):
+        pytest.importorskip("mlx_vlm.utils")
+        from types import SimpleNamespace
+
+        import mlx_vlm.utils as vlm_utils
+
+        from omlx.oq import _build_model_sanitizer
+
+        class _Cfg:
+            def __init__(self, **fields):
+                self.__dict__.update(fields)
+
+            @classmethod
+            def from_dict(cls, fields):
+                return cls(**fields)
+
+        class _FakeModel:
+            @staticmethod
+            def sanitize(proxy, weights):
+                assert proxy.config.text_config.num_hidden_layers == 1
+                return weights
+
+        fake_module = SimpleNamespace(
+            Model=_FakeModel,
+            ModelConfig=_Cfg,
+            VisionConfig=_Cfg,
+            TextConfig=_Cfg,
+            VisionModel=object,
+            LanguageModel=object,
+        )
+
+        def unsupported_get_model_and_args(_config):
+            raise ValueError("Model type minimax_m3_vl not supported")
+
+        def apply_compat_patch():
+            vlm_utils.get_model_and_args = lambda _config: (
+                fake_module,
+                "minimax_m3_vl",
+            )
+            return True
+
+        monkeypatch.setattr(
+            vlm_utils,
+            "get_model_and_args",
+            unsupported_get_model_and_args,
+        )
+        monkeypatch.setattr(
+            "omlx.patches.mlx_vlm_minimax_m3_compat."
+            "apply_mlx_vlm_minimax_m3_compat_patch",
+            apply_compat_patch,
+        )
+        monkeypatch.setattr(
+            "mlx_vlm.utils.sanitize_weights",
+            lambda _model, weights, _config: weights,
+        )
+
+        config = {
+            "architectures": ["MiniMaxM3SparseForConditionalGeneration"],
+            "model_type": "minimax_m3_vl",
+            "text_config": {"num_hidden_layers": 1, "hidden_size": 16},
+            "vision_config": {"hidden_size": 8},
+        }
+        sanitize = _build_model_sanitizer(config, text_only=False)
+
+        assert sanitize is not None
+        assert sanitize({"weight": 1}) == {"weight": 1}
 
 
 # =============================================================================
@@ -3317,6 +3635,60 @@ class TestMeasureSensitivityVlmMtp:
         )
 
         assert mock_load.call_args.kwargs["trust_remote_code"] is True
+
+
+class TestMeasureSensitivityQuantizedVlm:
+    def test_quantized_vlm_proxy_uses_vlm_loader(self, monkeypatch):
+        from omlx import oq as oq_mod
+
+        maybe_apply = MagicMock()
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.utils.model_loading",
+            MagicMock(
+                maybe_apply_pre_load_patches=maybe_apply,
+                _has_mtp_heads=MagicMock(return_value=False),
+                _checkpoint_has_mtp_weights=MagicMock(return_value=False),
+            ),
+        )
+
+        vlm_load = MagicMock(return_value=MagicMock())
+        tokenizer_load = MagicMock(return_value=MagicMock())
+        lm_load = MagicMock(side_effect=AssertionError("mlx-lm loader used for VLM"))
+
+        monkeypatch.setitem(sys.modules, "mlx_vlm", MagicMock())
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx_vlm.utils",
+            MagicMock(load_model=vlm_load),
+        )
+        monkeypatch.setitem(sys.modules, "mlx_lm", MagicMock(load=lm_load))
+        monkeypatch.setitem(
+            sys.modules,
+            "mlx_lm.tokenizer_utils",
+            MagicMock(load=tokenizer_load),
+        )
+        monkeypatch.setattr(
+            oq_mod,
+            "_load_calibration_data",
+            MagicMock(return_value=None),
+        )
+
+        result = _measure_sensitivity_from_quantized_model(
+            "/fake/minimax-proxy",
+            {"vision_config": {}, "model_type": "minimax_m3_vl"},
+            3.5,
+            trust_remote_code=True,
+        )
+
+        assert result == {}
+        maybe_apply.assert_called_once_with("/fake/minimax-proxy", for_vlm=True)
+        vlm_load.assert_called_once()
+        assert vlm_load.call_args.args[0] == Path("/fake/minimax-proxy")
+        assert vlm_load.call_args.kwargs["lazy"] is True
+        assert vlm_load.call_args.kwargs["trust_remote_code"] is True
+        tokenizer_load.assert_called_once_with(Path("/fake/minimax-proxy"))
+        lm_load.assert_not_called()
 
 
 # =============================================================================

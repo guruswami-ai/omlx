@@ -195,6 +195,32 @@ def test_glm_patch_installs_native_indexer_schedule():
     assert [len(c.caches) for c in model.make_cache()] == [2, 1, 2, 1, 2, 1]
 
 
+def test_glm_indexer_rope_interleave_matches_upstream_contract(monkeypatch):
+    glm_moe_dsa = _load_patched_glm_module()
+
+    from omlx.patches.glm_moe_dsa import deepseek_v32 as vendored_deepseek_v32
+
+    glm_fields = glm_moe_dsa.ModelArgs.__dataclass_fields__
+    dsv32_fields = vendored_deepseek_v32.ModelArgs.__dataclass_fields__
+
+    assert glm_fields["indexer_rope_interleave"].default is True
+    assert dsv32_fields["indexer_rope_interleave"].default is False
+
+    calls = []
+
+    def fake_initialize_rope(**kwargs):
+        calls.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(vendored_deepseek_v32, "initialize_rope", fake_initialize_rope)
+
+    args = _small_glm_args(glm_moe_dsa)
+    assert args.indexer_rope_interleave is True
+    vendored_deepseek_v32.Indexer(args)
+
+    assert calls[-1]["traditional"] is True
+
+
 def test_glm_direct_sparse_mla_uses_fork_default_threshold(monkeypatch):
     from omlx.patches.glm_moe_dsa import glm_moe_dsa_model
 
@@ -220,20 +246,25 @@ def test_glm_native_fused_kernels_match_reference(monkeypatch):
 
     mx.random.seed(7)
 
-    tokens, topk, dims = 8, 8, 64
-    x_sorted = mx.random.normal((tokens * topk, 1, dims), dtype=mx.float16)
-    inv_order = mx.array(list(range(tokens * topk - 1, -1, -1)), dtype=mx.uint32)
-    scores = mx.softmax(
-        mx.random.normal((tokens, topk), dtype=mx.float32),
-        axis=-1,
-    )
-    y_native = fast.glm_moe_weighted_sum(x_sorted, inv_order, scores)
-    x_ref = mx.squeeze(x_sorted, -2)
-    x_ref = mx.take(x_ref, inv_order, axis=0)
-    x_ref = mx.reshape(x_ref, scores.shape + (dims,))
-    y_ref = mx.sum(x_ref * mx.expand_dims(scores, -1), axis=-2).astype(mx.float16)
-    mx.eval(y_native, y_ref)
-    assert float(mx.max(mx.abs(y_native - y_ref)).item()) == 0.0
+    tokens, dims = 8, 64
+    for topk in (8, 6):
+        x_sorted = mx.random.normal((tokens * topk, 1, dims), dtype=mx.float16)
+        inv_order = mx.array(
+            list(range(tokens * topk - 1, -1, -1)), dtype=mx.uint32
+        )
+        scores = mx.softmax(
+            mx.random.normal((tokens, topk), dtype=mx.float32),
+            axis=-1,
+        )
+        y_native = fast.glm_moe_weighted_sum(x_sorted, inv_order, scores)
+        x_ref = mx.squeeze(x_sorted, -2)
+        x_ref = mx.take(x_ref, inv_order, axis=0)
+        x_ref = mx.reshape(x_ref, scores.shape + (dims,))
+        y_ref = mx.sum(x_ref * mx.expand_dims(scores, -1), axis=-2).astype(
+            mx.float16
+        )
+        mx.eval(y_native, y_ref)
+        assert float(mx.max(mx.abs(y_native - y_ref)).item()) == 0.0
 
     batch, heads, length, latent, values = 1, 64, 1, 512, 256
     x = mx.random.normal((batch, heads, length, latent), dtype=mx.float16)
