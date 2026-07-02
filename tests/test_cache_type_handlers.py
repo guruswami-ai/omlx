@@ -900,6 +900,9 @@ class TestCacheTypeRegistry:
         handler = CacheTypeRegistry.get_handler_by_class_name("RotatingKVCache")
         assert isinstance(handler, RotatingKVCacheHandler)
 
+        handler = CacheTypeRegistry.get_handler_by_class_name("BufferedRotatingKVCache")
+        assert isinstance(handler, RotatingKVCacheHandler)
+
     def test_get_handler_by_class_name_unknown(self):
         """Test getting handler for unknown class name."""
         handler = CacheTypeRegistry.get_handler_by_class_name("UnknownCache")
@@ -923,6 +926,13 @@ class TestCacheTypeRegistry:
         mock_rotating.__class__.__name__ = "RotatingKVCache"
         assert (
             CacheTypeRegistry.detect_cache_type(mock_rotating)
+            == CacheType.ROTATING_KVCACHE
+        )
+
+        mock_buffered = MagicMock()
+        mock_buffered.__class__.__name__ = "BufferedRotatingKVCache"
+        assert (
+            CacheTypeRegistry.detect_cache_type(mock_buffered)
             == CacheType.ROTATING_KVCACHE
         )
 
@@ -984,6 +994,7 @@ class TestCacheTypeRegistry:
         names = CacheTypeRegistry.list_known_class_names()
         assert "KVCache" in names
         assert "RotatingKVCache" in names
+        assert "BufferedRotatingKVCache" in names
         assert "ArraysCache" in names
 
     def test_register_handler(self):
