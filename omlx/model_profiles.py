@@ -62,6 +62,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "dflash_verify_mode",
     "dflash_copyspec_mode",
     "mtp_enabled",
+    "mtp_num_draft_tokens",
     "vlm_mtp_enabled",
     "vlm_mtp_draft_model",
     "vlm_mtp_draft_block_size",
