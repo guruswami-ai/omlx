@@ -931,6 +931,58 @@ class TestMakeQuantizationConfigMtp:
         assert not any(k.startswith("mtp.") for k in qcfg)
 
 
+class TestDeepSeekV4SanitizeHcAliases:
+    """Sanitize accepts both upstream HC key spellings for V4 checkpoints."""
+
+    @staticmethod
+    def _fake_model():
+        return SimpleNamespace(
+            args=SimpleNamespace(
+                num_hidden_layers=1,
+                n_routed_experts=0,
+                o_groups=1,
+                o_lora_rank=1,
+            )
+        )
+
+    def test_dotted_hc_aliases_remap_to_model_modules(self, applied_patch):
+        mx = pytest.importorskip("mlx.core")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        weights = {
+            "model.layers.0.hc_attn.base": mx.zeros((1,), dtype=mx.float32),
+            "model.layers.0.hc_attn.fn": mx.zeros((1, 1), dtype=mx.float32),
+            "model.layers.0.hc_attn.scale": mx.zeros((3,), dtype=mx.float32),
+            "model.layers.0.hc_ffn.base": mx.zeros((1,), dtype=mx.float32),
+            "model.layers.0.hc_ffn.fn": mx.zeros((1, 1), dtype=mx.float32),
+            "model.layers.0.hc_ffn.scale": mx.zeros((3,), dtype=mx.float32),
+        }
+
+        out = dsv4.Model.sanitize(self._fake_model(), dict(weights))
+
+        assert "model.layers.0.attn_hc.base" in out
+        assert "model.layers.0.attn_hc.fn" in out
+        assert "model.layers.0.attn_hc.scale" in out
+        assert "model.layers.0.ffn_hc.base" in out
+        assert "model.layers.0.ffn_hc.fn" in out
+        assert "model.layers.0.ffn_hc.scale" in out
+        assert not any(".hc_attn." in key or ".hc_ffn." in key for key in out)
+
+    def test_dotted_hc_alias_does_not_override_canonical_key(self, applied_patch):
+        mx = pytest.importorskip("mlx.core")
+
+        dsv4 = sys.modules["mlx_lm.models.deepseek_v4"]
+        weights = {
+            "model.layers.0.hc_attn.base": mx.zeros((1,), dtype=mx.float32),
+            "model.layers.0.attn_hc.base": mx.zeros((2,), dtype=mx.float32),
+        }
+
+        out = dsv4.Model.sanitize(self._fake_model(), dict(weights))
+
+        assert out["model.layers.0.attn_hc.base"].shape == (2,)
+        assert "model.layers.0.hc_attn.base" not in out
+
+
 class TestMtpSanitizeWoAReshape:
     """The MTP patch sanitize must reshape mtp.<i>.block.attn.wo_a from the
     2D nn.Linear layout to the 3D MultiLinear layout, like the backbone."""
@@ -977,6 +1029,21 @@ class TestMtpSanitizeWoAReshape:
         }
         out = patched_sanitize(self._fake_model(), weights)
         assert out["mtp.0.block.attn.wo_a.weight"].shape == (2, 4, 16)
+
+    def test_mtp_dotted_hc_alias_nested_under_block(self, patched_sanitize):
+        import mlx.core as mx
+
+        weights = {
+            "mtp.0.hc_attn.base": mx.zeros((1,), dtype=mx.float32),
+            "mtp.0.hc_ffn.scale": mx.zeros((3,), dtype=mx.float32),
+        }
+
+        out = patched_sanitize(self._fake_model(), weights)
+
+        assert "mtp.0.block.attn_hc.base" in out
+        assert "mtp.0.block.ffn_hc.scale" in out
+        assert "mtp.0.hc_attn.base" not in out
+        assert "mtp.0.hc_ffn.scale" not in out
 
 
 class TestMtpBackboneInterface:
