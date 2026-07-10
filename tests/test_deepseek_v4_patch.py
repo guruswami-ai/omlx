@@ -4,6 +4,7 @@
 import importlib
 import inspect
 import sys
+from types import SimpleNamespace
 
 import pytest
 
