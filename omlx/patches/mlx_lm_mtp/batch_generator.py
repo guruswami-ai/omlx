@@ -4244,6 +4244,14 @@ def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
     return SparseDraftQ(ids, mx.zeros(ids.shape, dtype=mx.float32), vocab)
 
 
+def _copy_draft_q(copied: List[int], vocab: int) -> SparseDraftQ:
+    """One-hot draft distributions for a copied window."""
+    import mlx.core as mx
+
+    ids = mx.array(copied, dtype=mx.int32)[:, None]
+    return SparseDraftQ(ids, mx.zeros(ids.shape, dtype=mx.float32), vocab)
+
+
 def _run_verify_cycle_chain(
     gen_batch: Any,
     state: _MtpState,
