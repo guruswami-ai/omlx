@@ -572,6 +572,10 @@ class _RegisteredRow(NamedTuple):
 
 _UID_ROW_REGISTRY_MAX = 4096
 _QWEN4_WIDE_PREFILL_STEP = 8192
+# DeepSeek-V4.1-Flash: the packed attention and indexer kernels stream arbitrary
+# chunk widths, so wide chunks feed the grouped expert GEMMs more rows per expert
+# from the first chunk (jundot/omlx#3949, DeepSeek-V4.1 parts only).
+_DSV41_WIDE_PREFILL_STEP = 8192
 # Keyed by (id(model), uid): mlx-lm's BatchGenerator numbers uids per
 # instance starting at 0, so two engines serving concurrently (or an engine
 # reload) produce colliding uid sequences. The model object is the one
@@ -1981,6 +1985,7 @@ class Scheduler:
         self._qwen4_wide_first_chunk = bool(
             self._qwen4_wide_prefill_step
         ) and not self._qwen4_ple_gathers_ahead()
+        self._dsv41_wide_prefill_step = self._detect_dsv41_wide_prefill_step()
 
         # For strict RotatingKVCache reuse, align paged cache block size to
         # the model's rotating window size when paged cache is enabled.
@@ -3043,6 +3048,43 @@ class Scheduler:
             logger.debug("qwen4 wide prefill probe failed", exc_info=True)
         return 0
 
+    def _detect_dsv41_wide_prefill_step(self) -> int:
+        """Return the DeepSeek-V4.1-Flash prefill step on native-kernel hosts.
+
+        Wide chunks feed the grouped expert GEMMs more rows per expert; the
+        packed attention/indexer kernels stream arbitrary chunk widths and the
+        per-layer eval backpressure already bounds chunk residency. Measured on
+        a non-NAX M3 Ultra Studio: pp4096 +13.5%, pp8192 +9.3% at 8192
+        (jundot/omlx#3949, same-build A/B), so the gate is native
+        kernel + >=64GB without the NAX requirement. Narrow hosts keep the
+        existing floor/default geometry.
+        ``OMLX_DSV41_WIDE_STEP_FORCE`` overrides: >0 forces that width
+        (probe other boundaries), 0 disables (kill switch).
+        """
+        try:
+            model_type = str(getattr(self.model, "model_type", "") or "")
+            if not model_type:
+                model_type = str(
+                    getattr(getattr(self.model, "config", None), "model_type", "") or ""
+                )
+            if not model_type.startswith("deepseek_v41"):
+                return 0
+            raw = os.environ.get("OMLX_DSV41_WIDE_STEP_FORCE")
+            if raw is not None:
+                force = int(raw or 0)
+                return force if force > 0 else 0
+            from .custom_kernels.glm_moe_dsa import fast
+            from .settings import get_system_memory
+
+            if fast.is_native_available() and fast.has_symbol(
+                "deepseek_v41_packed_attention"
+            ):
+                if get_system_memory() >= 64 * 1024**3:
+                    return _DSV41_WIDE_PREFILL_STEP
+        except Exception:
+            logger.debug("deepseek_v41 wide prefill probe failed", exc_info=True)
+        return 0
+
     def _qwen4_ple_gathers_ahead(self) -> bool:
         """True when SSD-backed PLE rows are gathered one prefill chunk ahead.
 
@@ -3111,6 +3153,7 @@ class Scheduler:
             int(self.config.prefill_step_size or 0),
             self._qwen35_prefill_floor,
             self._qwen4_wide_prefill_step,
+            self._dsv41_wide_prefill_step,
         )
         if self.config.paged_cache_block_size >= target:
             return
@@ -5890,6 +5933,14 @@ class Scheduler:
                 if getattr(self, "block_aware_cache", None) is None:
                     # No block clamp runs; end on the grid that cache-ON uses.
                     size = wide - processed_tokens % wide
+            dsv41_wide = getattr(self, "_dsv41_wide_prefill_step", 0)
+            if dsv41_wide and size <= dsv41_wide:
+                # DeepSeek-V4.1-Flash goes wide from the first chunk to feed
+                # the grouped expert GEMMs; the packed attention/indexer
+                # kernels stream any chunk width.
+                size = dsv41_wide
+                if getattr(self, "block_aware_cache", None) is None:
+                    size = dsv41_wide - processed_tokens % dsv41_wide
             return size
         from .patches.minimax_m3.generate_patch import (
             _prefill_step_size_for_progress as _minimax_prefill_step_size,
