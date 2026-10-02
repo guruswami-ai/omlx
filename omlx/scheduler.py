@@ -2716,21 +2716,24 @@ class Scheduler:
                             "Async store_cache for %s raised: %s", request_id, exc
                         )
             try:
-                # Run batch_generator.remove on the inference thread.
-                try:
-                    _safe_sync_stream(self._stream)
-                    self._remove_uid_from_active_batch(uid)
-                    if hasattr(self.model, "unregister_rope_delta"):
-                        self.model.unregister_rope_delta(uid)
-                except Exception as e:
-                    logger.warning(
-                        "Deferred batch_generator.remove(uid=%s) failed: %s",
-                        uid,
-                        e,
-                    )
-                # Cleanup uid maps now that the slot is reclaimable.
-                _unregister_uid_row(self.model, uid)
-                self.uid_to_request_id.pop(uid, None)
+                # A batch generator reset drops this row and the next generator
+                # reuses uids from 0. Touch the uid only while this request owns it.
+                if self.uid_to_request_id.get(uid) == request_id:
+                    # Run batch_generator.remove on the inference thread.
+                    try:
+                        _safe_sync_stream(self._stream)
+                        self._remove_uid_from_active_batch(uid)
+                        if hasattr(self.model, "unregister_rope_delta"):
+                            self.model.unregister_rope_delta(uid)
+                    except Exception as e:
+                        logger.warning(
+                            "Deferred batch_generator.remove(uid=%s) failed: %s",
+                            uid,
+                            e,
+                        )
+                    # Cleanup uid maps now that the slot is reclaimable.
+                    _unregister_uid_row(self.model, uid)
+                    self.uid_to_request_id.pop(uid, None)
                 if self.request_id_to_uid.get(request_id) == uid:
                     self.request_id_to_uid.pop(request_id, None)
                 self._inflight_store_futures.pop(request_id, None)
