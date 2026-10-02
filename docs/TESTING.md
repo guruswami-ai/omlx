@@ -192,3 +192,7 @@ FP16/BF16, varied RMS weights, three epsilon values, every gate encoding, and
 fallback when the installed MLX arithmetic is unsupported. The check supports
 both released and nightly MLX builds; it does not assume the exponential from
 the version number.
+
+# Engine idle timing tests
+
+`python -m pytest -q tests/test_engine_idle_completion.py tests/test_engine_pool.py tests/test_active_models_visibility.py` checks that lease completion refreshes the LRU/TTL timestamp and that busy models report zero idle time. The regression cases include a request longer than its TTL, overlapping requests, pending unload, cancelled release, and redundant releases.
